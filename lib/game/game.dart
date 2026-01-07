@@ -1,493 +1,519 @@
 import 'dart:async';
 import 'dart:math';
+import 'package:flame/cache.dart';
 import 'package:flame/components.dart';
 import 'package:flame/events.dart';
 import 'package:flame/game.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../components/game_grid.dart';
+import '../components/tile_component.dart';
+import '../components/pattern_display.dart';
+import '../components/timer_component.dart';
+import '../components/score_display.dart';
+import '../components/gems_display.dart';
+import '../controllers/game_controller.dart';
+import '../models/level_config.dart';
+import '../models/game_state.dart';
+import '../services/analytics_service.dart';
+import '../services/audio_service.dart';
+import '../utils/constants.dart';
+
 /// Main game class for the tile-swapping puzzle game
 class Batch20260107110734Puzzle01Game extends FlameGame
-    with HasDragEvents, HasTapEvents, HasCollisionDetection {
+    with HasTapDetector, HasDragDetector, HasCollisionDetection {
   
   /// Current game state
-  GameState _gameState = GameState.menu;
-  GameState get gameState => _gameState;
+  GameState gameState = GameState.playing;
   
-  /// Current level being played
-  int _currentLevel = 1;
-  int get currentLevel => _currentLevel;
+  /// Game controller for managing game logic
+  late GameController gameController;
   
-  /// Player's current score
-  int _score = 0;
-  int get score => _score;
+  /// Analytics service for tracking events
+  late AnalyticsService analyticsService;
   
-  /// Player's gems (currency)
-  int _gems = 0;
-  int get gems => _gems;
+  /// Audio service for sound effects
+  late AudioService audioService;
   
-  /// Time remaining in current level
-  double _timeRemaining = 90.0;
-  double get timeRemaining => _timeRemaining;
+  /// Current level configuration
+  LevelConfig? currentLevel;
   
-  /// Grid dimensions for current level
-  int _gridWidth = 3;
-  int _gridHeight = 3;
+  /// Game grid component
+  GameGrid? gameGrid;
   
-  /// Game components
-  late GameGrid _gameGrid;
-  late Timer _gameTimer;
-  late ScoreManager _scoreManager;
-  late LevelManager _levelManager;
-  late PatternManager _patternManager;
+  /// Pattern display component
+  PatternDisplay? patternDisplay;
   
-  /// Analytics and services hooks
-  Function(String event, Map<String, dynamic> parameters)? onAnalyticsEvent;
-  Function()? onShowRewardedAd;
-  Function(String key, dynamic value)? onSaveData;
-  Function(String key)? onLoadData;
+  /// Timer component
+  TimerComponent? timerComponent;
+  
+  /// Score display component
+  ScoreDisplay? scoreDisplay;
+  
+  /// Gems display component
+  GemsDisplay? gemsDisplay;
+  
+  /// Current score
+  int score = 0;
+  
+  /// Current gems count
+  int gems = 0;
+  
+  /// Current level number
+  int currentLevelNumber = 1;
+  
+  /// Time remaining in seconds
+  double timeRemaining = 0;
+  
+  /// Whether the game is paused
+  bool isPaused = false;
+  
+  /// Selected tile for swapping
+  TileComponent? selectedTile;
+  
+  /// Background component
+  SpriteComponent? background;
+  
+  /// Particle effects
+  final List<Component> particles = [];
   
   @override
   Future<void> onLoad() async {
-    await super.onLoad();
+    super.onLoad();
     
-    // Initialize managers
-    _scoreManager = ScoreManager();
-    _levelManager = LevelManager();
-    _patternManager = PatternManager();
+    // Initialize services
+    gameController = GameController();
+    analyticsService = AnalyticsService();
+    audioService = AudioService();
     
-    // Load saved data
-    await _loadGameData();
+    // Set up camera
+    camera.viewfinder.visibleGameSize = size;
     
-    // Initialize game timer
-    _gameTimer = Timer(
-      1.0,
-      repeat: true,
-      onTick: _updateTimer,
-    );
+    // Load background
+    await _loadBackground();
     
-    // Set up initial state
-    _changeGameState(GameState.menu);
+    // Initialize UI components
+    await _initializeUI();
     
-    // Track game start
-    _trackEvent('game_start', {
-      'level': _currentLevel,
-      'gems': _gems,
+    // Load first level
+    await loadLevel(1);
+    
+    // Log game start
+    analyticsService.logEvent('game_start', {
+      'level': currentLevelNumber,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
     });
+  }
+  
+  /// Load background sprite
+  Future<void> _loadBackground() async {
+    try {
+      final backgroundSprite = await Sprite.load('backgrounds/crystal_cave.png');
+      background = SpriteComponent(
+        sprite: backgroundSprite,
+        size: size,
+        position: Vector2.zero(),
+      );
+      add(background!);
+    } catch (e) {
+      // Fallback to colored background
+      final coloredBackground = RectangleComponent(
+        size: size,
+        paint: Paint()..color = const Color(0xFF2C3E50),
+      );
+      add(coloredBackground);
+    }
+  }
+  
+  /// Initialize UI components
+  Future<void> _initializeUI() async {
+    // Score display
+    scoreDisplay = ScoreDisplay(
+      position: Vector2(20, 60),
+      score: score,
+    );
+    add(scoreDisplay!);
+    
+    // Gems display
+    gemsDisplay = GemsDisplay(
+      position: Vector2(size.x - 120, 60),
+      gems: gems,
+    );
+    add(gemsDisplay!);
+    
+    // Timer component
+    timerComponent = TimerComponent(
+      position: Vector2(size.x / 2 - 50, 60),
+      timeRemaining: timeRemaining,
+    );
+    add(timerComponent!);
+  }
+  
+  /// Load a specific level
+  Future<void> loadLevel(int levelNumber) async {
+    try {
+      // Clear existing components
+      await _clearLevel();
+      
+      // Load level configuration
+      currentLevel = await gameController.loadLevel(levelNumber);
+      currentLevelNumber = levelNumber;
+      
+      if (currentLevel == null) {
+        throw Exception('Failed to load level $levelNumber');
+      }
+      
+      // Set initial time
+      timeRemaining = currentLevel!.timeLimit.toDouble();
+      timerComponent?.updateTime(timeRemaining);
+      
+      // Create game grid
+      gameGrid = GameGrid(
+        gridSize: currentLevel!.gridSize,
+        position: Vector2(
+          size.x / 2 - (currentLevel!.gridSize * GameConstants.tileSize) / 2,
+          size.y / 2 - (currentLevel!.gridSize * GameConstants.tileSize) / 2,
+        ),
+        tileColors: currentLevel!.availableColors,
+      );
+      add(gameGrid!);
+      
+      // Create pattern display
+      patternDisplay = PatternDisplay(
+        patterns: currentLevel!.targetPatterns,
+        position: Vector2(20, 120),
+      );
+      add(patternDisplay!);
+      
+      // Generate initial grid
+      await gameGrid!.generateGrid();
+      
+      // Set game state
+      gameState = GameState.playing;
+      isPaused = false;
+      
+      // Log level start
+      analyticsService.logEvent('level_start', {
+        'level': levelNumber,
+        'grid_size': currentLevel!.gridSize,
+        'time_limit': currentLevel!.timeLimit,
+        'pattern_count': currentLevel!.targetPatterns.length,
+      });
+      
+    } catch (e) {
+      print('Error loading level $levelNumber: $e');
+      gameState = GameState.gameOver;
+    }
+  }
+  
+  /// Clear current level components
+  Future<void> _clearLevel() async {
+    gameGrid?.removeFromParent();
+    patternDisplay?.removeFromParent();
+    selectedTile = null;
+    
+    // Clear particles
+    for (final particle in particles) {
+      particle.removeFromParent();
+    }
+    particles.clear();
   }
   
   @override
   void update(double dt) {
     super.update(dt);
     
-    if (_gameState == GameState.playing) {
-      _gameTimer.update(dt);
-      _gameGrid.update(dt);
-      _checkWinCondition();
-      _checkFailCondition();
+    if (gameState != GameState.playing || isPaused) {
+      return;
     }
-  }
-  
-  /// Start a new level
-  void startLevel(int level) {
-    try {
-      _currentLevel = level;
-      final levelConfig = _levelManager.getLevelConfig(level);
-      
-      _gridWidth = levelConfig.gridWidth;
-      _gridHeight = levelConfig.gridHeight;
-      _timeRemaining = levelConfig.timeLimit;
-      
-      // Create new game grid
-      _gameGrid = GameGrid(
-        width: _gridWidth,
-        height: _gridHeight,
-        tileSize: 60.0,
-        position: Vector2(size.x / 2, size.y / 2),
-      );
-      
-      // Set target patterns
-      _patternManager.setTargetPatterns(levelConfig.targetPatterns);
-      
-      // Add grid to world
-      world.removeAll(world.children.whereType<GameGrid>());
-      world.add(_gameGrid);
-      
-      _changeGameState(GameState.playing);
-      
-      _trackEvent('level_start', {
-        'level': level,
-        'grid_size': '${_gridWidth}x$_gridHeight',
-        'time_limit': _timeRemaining,
-      });
-    } catch (e) {
-      debugPrint('Error starting level $level: $e');
-      _changeGameState(GameState.menu);
-    }
-  }
-  
-  /// Handle tile swap
-  void swapTiles(Vector2 pos1, Vector2 pos2) {
-    if (_gameState != GameState.playing) return;
     
-    try {
-      if (_gameGrid.canSwapTiles(pos1, pos2)) {
-        _gameGrid.swapTiles(pos1, pos2);
-        
-        // Check for matches after swap
-        final matches = _patternManager.checkMatches(_gameGrid.getTileGrid());
-        if (matches.isNotEmpty) {
-          _processMatches(matches);
-        }
-        
-        HapticFeedback.lightImpact();
-      }
-    } catch (e) {
-      debugPrint('Error swapping tiles: $e');
+    // Update timer
+    timeRemaining -= dt;
+    timerComponent?.updateTime(timeRemaining);
+    
+    // Check for time up
+    if (timeRemaining <= 0) {
+      _handleTimeUp();
+      return;
+    }
+    
+    // Check for level completion
+    if (_checkLevelComplete()) {
+      _handleLevelComplete();
+      return;
+    }
+    
+    // Check for no valid moves
+    if (_checkNoValidMoves()) {
+      _handleNoValidMoves();
+      return;
     }
   }
   
-  /// Process pattern matches
-  void _processMatches(List<PatternMatch> matches) {
-    int pointsEarned = 0;
+  /// Handle tap events
+  @override
+  bool onTapDown(TapDownInfo info) {
+    if (gameState != GameState.playing || isPaused) {
+      return false;
+    }
+    
+    final tappedTile = gameGrid?.getTileAtPosition(info.eventPosition.global);
+    if (tappedTile != null) {
+      _handleTileSelection(tappedTile);
+    }
+    
+    return true;
+  }
+  
+  /// Handle drag events for tile swapping
+  @override
+  bool onDragUpdate(DragUpdateInfo info) {
+    if (gameState != GameState.playing || isPaused || selectedTile == null) {
+      return false;
+    }
+    
+    final draggedTile = gameGrid?.getTileAtPosition(info.eventPosition.global);
+    if (draggedTile != null && draggedTile != selectedTile) {
+      _attemptTileSwap(selectedTile!, draggedTile);
+    }
+    
+    return true;
+  }
+  
+  /// Handle tile selection
+  void _handleTileSelection(TileComponent tile) {
+    if (selectedTile == tile) {
+      // Deselect if same tile
+      selectedTile?.setSelected(false);
+      selectedTile = null;
+    } else if (selectedTile == null) {
+      // Select new tile
+      selectedTile = tile;
+      tile.setSelected(true);
+      audioService.playSound('tile_select');
+    } else {
+      // Attempt swap with previously selected tile
+      _attemptTileSwap(selectedTile!, tile);
+    }
+  }
+  
+  /// Attempt to swap two tiles
+  void _attemptTileSwap(TileComponent tile1, TileComponent tile2) {
+    if (!gameGrid!.areAdjacent(tile1, tile2)) {
+      // Not adjacent, just select the new tile
+      selectedTile?.setSelected(false);
+      selectedTile = tile2;
+      tile2.setSelected(true);
+      return;
+    }
+    
+    // Perform swap
+    gameGrid!.swapTiles(tile1, tile2);
+    
+    // Clear selection
+    selectedTile?.setSelected(false);
+    selectedTile = null;
+    
+    // Play swap sound
+    audioService.playSound('tile_swap');
+    
+    // Check for matches
+    final matches = gameGrid!.findMatches();
+    if (matches.isNotEmpty) {
+      _handleMatches(matches);
+    }
+    
+    // Add particle effect
+    _addSwapParticles(tile1.position, tile2.position);
+  }
+  
+  /// Handle found matches
+  void _handleMatches(List<List<TileComponent>> matches) {
+    int matchScore = 0;
     
     for (final match in matches) {
-      pointsEarned += match.points;
+      matchScore += match.length * GameConstants.pointsPerTile;
       
-      // Add bonus time for chain matches
-      if (match.isChain) {
-        _timeRemaining += 5.0;
+      // Add particle effects for matched tiles
+      for (final tile in match) {
+        _addMatchParticles(tile.position);
       }
     }
     
-    _addScore(pointsEarned);
-    _gameGrid.highlightMatches(matches);
-  }
-  
-  /// Add score and update gems
-  void _addScore(int points) {
-    _score += points;
+    // Update score
+    score += matchScore;
+    scoreDisplay?.updateScore(score);
     
-    // Convert score to gems (every 100 points = 1 gem)
-    final newGems = (_score ~/ 100) - (_gems);
-    if (newGems > 0) {
-      _gems += newGems;
+    // Play match sound
+    audioService.playSound('match_found');
+    
+    // Check for chain bonus
+    if (matches.length > 1) {
+      final chainBonus = matches.length * GameConstants.chainBonusMultiplier;
+      score += chainBonus;
+      timeRemaining += GameConstants.chainTimeBonus;
+      
+      audioService.playSound('chain_bonus');
+      _showFloatingText('+${chainBonus}', Vector2(size.x / 2, size.y / 2));
     }
+    
+    // Log match event
+    analyticsService.logEvent('match_found', {
+      'level': currentLevelNumber,
+      'match_count': matches.length,
+      'score_gained': matchScore,
+      'total_score': score,
+    });
   }
   
   /// Check if level is complete
-  void _checkWinCondition() {
-    if (_patternManager.areAllPatternsComplete(_gameGrid.getTileGrid())) {
-      _completeLevel();
-    }
+  bool _checkLevelComplete() {
+    if (currentLevel == null || gameGrid == null) return false;
+    
+    return gameGrid!.checkPatternsComplete(currentLevel!.targetPatterns);
   }
   
-  /// Check if level has failed
-  void _checkFailCondition() {
-    if (_timeRemaining <= 0) {
-      _failLevel('timer_expires');
-    } else if (!_gameGrid.hasValidMoves()) {
-      _failLevel('no_valid_moves_remaining');
-    }
+  /// Check if there are no valid moves remaining
+  bool _checkNoValidMoves() {
+    if (gameGrid == null) return false;
+    
+    return !gameGrid!.hasValidMoves();
   }
   
-  /// Complete current level
-  void _completeLevel() {
-    _changeGameState(GameState.levelComplete);
+  /// Handle level completion
+  void _handleLevelComplete() {
+    gameState = GameState.levelComplete;
     
-    // Calculate bonus gems
-    final timeBonus = (_timeRemaining / 10).floor();
-    final levelBonus = 10; // Base gems per level
-    final totalBonus = timeBonus + levelBonus;
+    // Calculate final score with time bonus
+    final timeBonus = (timeRemaining * GameConstants.timeBonusMultiplier).round();
+    score += timeBonus;
+    scoreDisplay?.updateScore(score);
     
-    _gems += totalBonus;
+    // Award gems
+    gems += currentLevel!.gemReward;
+    gemsDisplay?.updateGems(gems);
     
-    _trackEvent('level_complete', {
-      'level': _currentLevel,
-      'score': _score,
-      'time_remaining': _timeRemaining,
-      'gems_earned': totalBonus,
+    // Play completion sound
+    audioService.playSound('level_complete');
+    
+    // Add celebration particles
+    _addCelebrationParticles();
+    
+    // Log level completion
+    analyticsService.logEvent('level_complete', {
+      'level': currentLevelNumber,
+      'final_score': score,
+      'time_remaining': timeRemaining,
+      'time_bonus': timeBonus,
+      'gems_earned': currentLevel!.gemReward,
     });
     
-    _saveGameData();
+    // Show completion overlay
+    overlays.add('LevelCompleteOverlay');
   }
   
-  /// Fail current level
-  void _failLevel(String reason) {
-    _changeGameState(GameState.gameOver);
+  /// Handle time running out
+  void _handleTimeUp() {
+    gameState = GameState.gameOver;
     
-    _trackEvent('level_fail', {
-      'level': _currentLevel,
-      'reason': reason,
-      'score': _score,
-      'time_remaining': _timeRemaining,
+    // Play game over sound
+    audioService.playSound('time_up');
+    
+    // Log level failure
+    analyticsService.logEvent('level_fail', {
+      'level': currentLevelNumber,
+      'reason': 'timer_expires',
+      'final_score': score,
+      'time_remaining': 0,
     });
+    
+    // Show game over overlay
+    overlays.add('GameOverOverlay');
   }
   
-  /// Update game timer
-  void _updateTimer() {
-    if (_gameState == GameState.playing && _timeRemaining > 0) {
-      _timeRemaining -= 1.0;
-    }
-  }
-  
-  /// Change game state and update overlays
-  void _changeGameState(GameState newState) {
-    _gameState = newState;
+  /// Handle no valid moves remaining
+  void _handleNoValidMoves() {
+    gameState = GameState.gameOver;
     
-    // Remove all overlays
-    overlays.clear();
+    // Play game over sound
+    audioService.playSound('no_moves');
     
-    // Add appropriate overlay for new state
-    switch (newState) {
-      case GameState.menu:
-        overlays.add('MainMenu');
-        break;
-      case GameState.playing:
-        overlays.add('GameHUD');
-        break;
-      case GameState.paused:
-        overlays.add('PauseMenu');
-        break;
-      case GameState.gameOver:
-        overlays.add('GameOver');
-        break;
-      case GameState.levelComplete:
-        overlays.add('LevelComplete');
-        break;
-    }
+    // Log level failure
+    analyticsService.logEvent('level_fail', {
+      'level': currentLevelNumber,
+      'reason': 'no_valid_moves_remaining',
+      'final_score': score,
+      'time_remaining': timeRemaining,
+    });
+    
+    // Show game over overlay
+    overlays.add('GameOverOverlay');
   }
   
   /// Pause the game
   void pauseGame() {
-    if (_gameState == GameState.playing) {
-      _changeGameState(GameState.paused);
-      _gameTimer.stop();
-    }
+    isPaused = true;
+    overlays.add('PauseOverlay');
   }
   
   /// Resume the game
   void resumeGame() {
-    if (_gameState == GameState.paused) {
-      _changeGameState(GameState.playing);
-      _gameTimer.start();
-    }
+    isPaused = false;
+    overlays.remove('PauseOverlay');
   }
   
   /// Restart current level
-  void restartLevel() {
-    startLevel(_currentLevel);
+  Future<void> restartLevel() async {
+    score = 0;
+    scoreDisplay?.updateScore(score);
+    
+    await loadLevel(currentLevelNumber);
+    
+    overlays.remove('GameOverOverlay');
+    overlays.remove('LevelCompleteOverlay');
   }
   
-  /// Use hint (costs gems)
+  /// Load next level
+  Future<void> loadNextLevel() async {
+    if (currentLevelNumber < GameConstants.maxLevels) {
+      await loadLevel(currentLevelNumber + 1);
+    }
+    
+    overlays.remove('LevelCompleteOverlay');
+  }
+  
+  /// Use hint power-up
   void useHint() {
-    if (_gems >= 5 && _gameState == GameState.playing) {
-      _gems -= 5;
-      final hint = _gameGrid.getHint();
-      if (hint != null) {
-        _gameGrid.showHint(hint);
-      }
-      _saveGameData();
-    }
-  }
-  
-  /// Extend time (costs gems)
-  void extendTime() {
-    if (_gems >= 10 && _gameState == GameState.playing) {
-      _gems -= 10;
-      _timeRemaining += 30.0;
-      _saveGameData();
-    }
-  }
-  
-  /// Reveal pattern (costs gems)
-  void revealPattern() {
-    if (_gems >= 15 && _gameState == GameState.playing) {
-      _gems -= 15;
-      _patternManager.revealNextPattern();
-      _saveGameData();
-    }
-  }
-  
-  /// Check if level is unlocked
-  bool isLevelUnlocked(int level) {
-    return _levelManager.isLevelUnlocked(level);
-  }
-  
-  /// Unlock level with rewarded ad
-  void unlockLevelWithAd(int level) {
-    _trackEvent('unlock_prompt_shown', {'level': level});
-    
-    if (onShowRewardedAd != null) {
-      onShowRewardedAd!();
-    }
-  }
-  
-  /// Handle rewarded ad completion
-  void onRewardedAdCompleted(int level) {
-    _levelManager.unlockLevel(level);
-    _trackEvent('rewarded_ad_completed', {'level': level});
-    _trackEvent('level_unlocked', {'level': level});
-    _saveGameData();
-  }
-  
-  /// Handle rewarded ad failure
-  void onRewardedAdFailed() {
-    _trackEvent('rewarded_ad_failed', {});
-  }
-  
-  /// Save game data
-  void _saveGameData() {
-    if (onSaveData != null) {
-      onSaveData!('current_level', _currentLevel);
-      onSaveData!('gems', _gems);
-      onSaveData!('unlocked_levels', _levelManager.getUnlockedLevels());
-    }
-  }
-  
-  /// Load game data
-  Future<void> _loadGameData() async {
-    try {
-      if (onLoadData != null) {
-        _currentLevel = await onLoadData!('current_level') ?? 1;
-        _gems = await onLoadData!('gems') ?? 0;
-        final unlockedLevels = await onLoadData!('unlocked_levels') ?? [1, 2, 3];
-        _levelManager.setUnlockedLevels(List<int>.from(unlockedLevels));
-      }
-    } catch (e) {
-      debugPrint('Error loading game data: $e');
-    }
-  }
-  
-  /// Track analytics event
-  void _trackEvent(String event, Map<String, dynamic> parameters) {
-    if (onAnalyticsEvent != null) {
-      onAnalyticsEvent!(event, parameters);
-    }
-  }
-  
-  @override
-  bool onDragStart(DragStartEvent event) {
-    if (_gameState == GameState.playing) {
-      _gameGrid.onDragStart(event.localPosition);
-    }
-    return true;
-  }
-  
-  @override
-  bool onDragUpdate(DragUpdateEvent event) {
-    if (_gameState == GameState.playing) {
-      _gameGrid.onDragUpdate(event.localPosition);
-    }
-    return true;
-  }
-  
-  @override
-  bool onDragEnd(DragEndEvent event) {
-    if (_gameState == GameState.playing) {
-      _gameGrid.onDragEnd(event.localPosition);
-    }
-    return true;
-  }
-}
-
-/// Game state enumeration
-enum GameState {
-  menu,
-  playing,
-  paused,
-  gameOver,
-  levelComplete,
-}
-
-/// Game grid component for managing tiles
-class GameGrid extends Component {
-  final int width;
-  final int height;
-  final double tileSize;
-  final Vector2 position;
-  
-  late List<List<GameTile>> _tiles;
-  Vector2? _dragStart;
-  Vector2? _dragCurrent;
-  
-  GameGrid({
-    required this.width,
-    required this.height,
-    required this.tileSize,
-    required this.position,
-  });
-  
-  @override
-  Future<void> onLoad() async {
-    await super.onLoad();
-    _initializeTiles();
-  }
-  
-  void _initializeTiles() {
-    _tiles = List.generate(height, (y) =>
-        List.generate(width, (x) => GameTile(
-          gridX: x,
-          gridY: y,
-          color: TileColor.values[Random().nextInt(TileColor.values.length)],
-          size: tileSize,
-        ))
-    );
-    
-    // Add tiles to component tree
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-        final tile = _tiles[y][x];
-        tile.position = Vector2(
-          position.x + (x - width / 2) * tileSize,
-          position.y + (y - height / 2) * tileSize,
-        );
-        add(tile);
-      }
-    }
-  }
-  
-  bool canSwapTiles(Vector2 pos1, Vector2 pos2) {
-    final tile1 = _getTileAtPosition(pos1);
-    final tile2 = _getTileAtPosition(pos2);
-    
-    if (tile1 == null || tile2 == null) return false;
-    
-    // Check if tiles are adjacent
-    final dx = (tile1.gridX - tile2.gridX).abs();
-    final dy = (tile1.gridY - tile2.gridY).abs();
-    
-    return (dx == 1 && dy == 0) || (dx == 0 && dy == 1);
-  }
-  
-  void swapTiles(Vector2 pos1, Vector2 pos2) {
-    final tile1 = _getTileAtPosition(pos1);
-    final tile2 = _getTileAtPosition(pos2);
-    
-    if (tile1 != null && tile2 != null) {
-      // Swap colors
-      final tempColor = tile1.color;
-      tile1.color = tile2.color;
-      tile2.color = tempColor;
+    if (gems >= GameConstants.hintCost && gameGrid != null) {
+      gems -= GameConstants.hintCost;
+      gemsDisplay?.updateGems(gems);
       
-      // Animate swap
-      tile1.animateSwap();
-      tile2.animateSwap();
+      final hint = gameGrid!.getHint();
+      if (hint != null) {
+        hint.showHint();
+        audioService.playSound('hint_used');
+        
+        analyticsService.logEvent('hint_used', {
+          'level': currentLevelNumber,
+          'gems_spent': GameConstants.hintCost,
+          'remaining_gems': gems,
+        });
+      }
     }
   }
   
-  GameTile? _getTileAtPosition(Vector2 pos) {
-    final gridX = ((pos.x - position.x) / tileSize + width / 2).floor();
-    final gridY = ((pos.y - position.y) / tileSize + height / 2).floor();
-    
-    if (gridX >= 0 && gridX < width && gridY >= 0 && gridY < height) {
-      return _tiles[gridY][gridX];
-    }
-    return null;
-  }
-  
-  List<List<TileColor>> getTileGrid() {
-    return _tiles.map((row) => row.map((tile) => tile.color).toList()).toList();
-  }
-  
-  bool hasVali
+  /// Use time extension power-up
+  void useTimeExtension() {
+    if (gems >= GameConstants.timeExtensionCost) {
+      gems -= GameConstants.timeExtensionCost;
+      gemsDisplay?.updateGems(gems);
+      
+      timeRemaining += GameConstants.timeExtensionAmount;
+      timerComponent?.updateTime(timeRemaining);
+      
+      audioService.playSound('time_extension');
+      _showFloatingText('+${GameConstants.timeExtensionAmount}s', 
+                       Vector2(size.x / 2, size.y / 3));
+      
+      analyticsService.logEvent('time_extension_used', {

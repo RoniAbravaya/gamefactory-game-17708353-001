@@ -1,134 +1,216 @@
 import 'package:flame/components.dart';
 import 'package:flame/events.dart';
-import 'package:flame/collisions.dart';
+import 'package:flame/effects.dart';
 import 'package:flutter/services.dart';
+import 'dart:math' as math;
 
-/// Player component for the tile-swapping puzzle game
-/// Manages player interactions, score tracking, and visual feedback
-class Player extends SpriteAnimationComponent with HasKeyboardHandlerComponents, HasCollisionDetection {
-  /// Current player score
-  int score = 0;
+/// Player component for tile-swapping puzzle game
+/// Handles input detection, tile selection, and visual feedback
+class Player extends Component with HasGameRef, HasKeyboardHandlerComponents {
+  /// Current selected tile position
+  Vector2? selectedTilePosition;
   
-  /// Player gems (currency)
+  /// Previous selected tile for swap operations
+  Vector2? previousSelectedTilePosition;
+  
+  /// Player's current gem count
   int gems = 0;
   
-  /// Current level being played
-  int currentLevel = 1;
+  /// Current level score
+  int score = 0;
   
-  /// Time remaining in current level
-  double timeRemaining = 90.0;
+  /// Combo multiplier for consecutive matches
+  int comboMultiplier = 1;
   
-  /// Whether the player is currently making a move
-  bool isMoving = false;
+  /// Maximum combo multiplier
+  static const int maxComboMultiplier = 5;
   
-  /// Current animation state
-  PlayerState _currentState = PlayerState.idle;
+  /// Base points per tile match
+  static const int basePointsPerTile = 10;
   
-  /// Animation components for different states
-  late SpriteAnimation _idleAnimation;
-  late SpriteAnimation _celebrateAnimation;
-  late SpriteAnimation _thinkingAnimation;
+  /// Invulnerability duration after taking damage (in seconds)
+  static const double invulnerabilityDuration = 1.0;
   
-  /// Callback for when player completes a pattern
-  Function(int points)? onPatternComplete;
+  /// Current invulnerability timer
+  double invulnerabilityTimer = 0.0;
   
-  /// Callback for when player runs out of time
-  Function()? onTimeExpired;
+  /// Whether player is currently invulnerable
+  bool get isInvulnerable => invulnerabilityTimer > 0.0;
   
-  /// Callback for when score changes
-  Function(int newScore)? onScoreChanged;
-
+  /// Player health (used for time pressure mechanics)
+  int health = 3;
+  
+  /// Maximum player health
+  static const int maxHealth = 3;
+  
+  /// Animation state for visual feedback
+  PlayerAnimationState animationState = PlayerAnimationState.idle;
+  
+  /// Selection highlight effect component
+  late RectangleComponent selectionHighlight;
+  
+  /// Particle effect for successful swaps
+  late ParticleSystemComponent swapEffect;
+  
   @override
   Future<void> onLoad() async {
-    await super.onLoad();
+    super.onLoad();
     
-    // Load sprite animations
-    await _loadAnimations();
+    // Initialize selection highlight
+    selectionHighlight = RectangleComponent(
+      size: Vector2.all(64),
+      paint: Paint()
+        ..color = const Color(0xFF45B7D1)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.0,
+    );
+    selectionHighlight.opacity = 0.0;
+    add(selectionHighlight);
     
-    // Set initial animation
-    animation = _idleAnimation;
-    _currentState = PlayerState.idle;
-    
-    // Set up collision detection
-    add(RectangleHitbox());
-    
-    // Initialize position and size
-    size = Vector2(64, 64);
-    anchor = Anchor.center;
-  }
-
-  /// Load all player animations
-  Future<void> _loadAnimations() async {
-    try {
-      _idleAnimation = await game.loadSpriteAnimation(
-        'player_idle.png',
-        SpriteAnimationData.sequenced(
-          amount: 4,
-          stepTime: 0.5,
-          textureSize: Vector2(64, 64),
+    // Initialize particle effects
+    swapEffect = ParticleSystemComponent(
+      particle: Particle.generate(
+        count: 20,
+        lifespan: 0.5,
+        generator: (i) => AcceleratedParticle(
+          acceleration: Vector2(0, 100),
+          speed: Vector2.random() * 50,
+          position: Vector2.zero(),
+          child: CircleParticle(
+            radius: 2.0,
+            paint: Paint()..color = const Color(0xFF4ECDC4),
+          ),
         ),
-      );
-      
-      _celebrateAnimation = await game.loadSpriteAnimation(
-        'player_celebrate.png',
-        SpriteAnimationData.sequenced(
-          amount: 6,
-          stepTime: 0.2,
-          textureSize: Vector2(64, 64),
-        ),
-      );
-      
-      _thinkingAnimation = await game.loadSpriteAnimation(
-        'player_thinking.png',
-        SpriteAnimationData.sequenced(
-          amount: 3,
-          stepTime: 0.8,
-          textureSize: Vector2(64, 64),
-        ),
-      );
-    } catch (e) {
-      // Fallback to solid color rectangles if sprites fail to load
-      _createFallbackAnimations();
-    }
+      ),
+    );
+    add(swapEffect);
   }
-
-  /// Create fallback animations using solid colors
-  void _createFallbackAnimations() {
-    // This would create simple colored rectangle animations as fallback
-    // Implementation depends on your specific sprite loading setup
-  }
-
+  
   @override
   void update(double dt) {
     super.update(dt);
     
-    // Update timer
-    if (timeRemaining > 0) {
-      timeRemaining -= dt;
-      if (timeRemaining <= 0) {
-        timeRemaining = 0;
-        onTimeExpired?.call();
+    // Update invulnerability timer
+    if (invulnerabilityTimer > 0.0) {
+      invulnerabilityTimer -= dt;
+      if (invulnerabilityTimer <= 0.0) {
+        invulnerabilityTimer = 0.0;
+        _onInvulnerabilityEnd();
+      }
+    }
+    
+    // Update selection highlight position
+    if (selectedTilePosition != null) {
+      selectionHighlight.position = selectedTilePosition!;
+      if (selectionHighlight.opacity < 1.0) {
+        selectionHighlight.opacity = math.min(1.0, selectionHighlight.opacity + dt * 3.0);
+      }
+    } else {
+      if (selectionHighlight.opacity > 0.0) {
+        selectionHighlight.opacity = math.max(0.0, selectionHighlight.opacity - dt * 5.0);
       }
     }
   }
-
-  /// Add points to player score
-  void addScore(int points) {
-    score += points;
-    onScoreChanged?.call(score);
-    
-    // Trigger celebration animation for significant scores
-    if (points >= 100) {
-      setState(PlayerState.celebrate);
+  
+  /// Handles tile selection at the given position
+  void selectTile(Vector2 tilePosition) {
+    try {
+      if (selectedTilePosition == null) {
+        // First tile selection
+        selectedTilePosition = tilePosition.clone();
+        _playSelectionFeedback();
+        animationState = PlayerAnimationState.selecting;
+      } else if (selectedTilePosition == tilePosition) {
+        // Deselect current tile
+        deselectTile();
+      } else {
+        // Second tile selection - attempt swap
+        previousSelectedTilePosition = selectedTilePosition!.clone();
+        _attemptTileSwap(selectedTilePosition!, tilePosition);
+        selectedTilePosition = null;
+      }
+    } catch (e) {
+      // Handle selection errors gracefully
+      deselectTile();
     }
   }
-
-  /// Add gems to player currency
-  void addGems(int amount) {
-    gems += amount;
+  
+  /// Deselects the currently selected tile
+  void deselectTile() {
+    selectedTilePosition = null;
+    previousSelectedTilePosition = null;
+    animationState = PlayerAnimationState.idle;
   }
-
-  /// Spend gems if player has enough
+  
+  /// Attempts to swap two tiles if they are adjacent
+  void _attemptTileSwap(Vector2 tile1, Vector2 tile2) {
+    if (_areAdjacent(tile1, tile2)) {
+      _performTileSwap(tile1, tile2);
+    } else {
+      // Invalid swap - provide feedback
+      _playInvalidSwapFeedback();
+      selectedTilePosition = tile2.clone();
+    }
+  }
+  
+  /// Checks if two tile positions are adjacent
+  bool _areAdjacent(Vector2 tile1, Vector2 tile2) {
+    final dx = (tile1.x - tile2.x).abs();
+    final dy = (tile1.y - tile2.y).abs();
+    return (dx == 1 && dy == 0) || (dx == 0 && dy == 1);
+  }
+  
+  /// Performs the actual tile swap operation
+  void _performTileSwap(Vector2 tile1, Vector2 tile2) {
+    animationState = PlayerAnimationState.swapping;
+    
+    // Trigger swap effect
+    swapEffect.position = (tile1 + tile2) / 2;
+    swapEffect.reset();
+    
+    // Play swap feedback
+    _playSwapFeedback();
+    
+    // Reset animation state after effect
+    Future.delayed(const Duration(milliseconds: 300), () {
+      animationState = PlayerAnimationState.idle;
+    });
+  }
+  
+  /// Awards points for successful pattern matches
+  void awardPoints(int tilesMatched, {bool isChainMatch = false}) {
+    try {
+      int points = tilesMatched * basePointsPerTile * comboMultiplier;
+      
+      if (isChainMatch) {
+        points = (points * 1.5).round();
+        _incrementCombo();
+      } else {
+        _resetCombo();
+      }
+      
+      score += points;
+      animationState = PlayerAnimationState.celebrating;
+      
+      // Reset animation after celebration
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (animationState == PlayerAnimationState.celebrating) {
+          animationState = PlayerAnimationState.idle;
+        }
+      });
+    } catch (e) {
+      // Handle scoring errors gracefully
+      _resetCombo();
+    }
+  }
+  
+  /// Awards gems to the player
+  void awardGems(int amount) {
+    gems += amount;
+    gems = math.max(0, gems); // Ensure gems never go negative
+  }
+  
+  /// Spends gems if player has enough
   bool spendGems(int amount) {
     if (gems >= amount) {
       gems -= amount;
@@ -136,139 +218,149 @@ class Player extends SpriteAnimationComponent with HasKeyboardHandlerComponents,
     }
     return false;
   }
-
-  /// Set player animation state
-  void setState(PlayerState newState) {
-    if (_currentState == newState) return;
+  
+  /// Takes damage and triggers invulnerability
+  void takeDamage(int damage) {
+    if (isInvulnerable) return;
     
-    _currentState = newState;
+    health -= damage;
+    health = math.max(0, health);
     
-    switch (newState) {
-      case PlayerState.idle:
-        animation = _idleAnimation;
-        break;
-      case PlayerState.thinking:
-        animation = _thinkingAnimation;
-        break;
-      case PlayerState.celebrate:
-        animation = _celebrateAnimation;
-        // Auto-return to idle after celebration
-        Future.delayed(const Duration(seconds: 1), () {
-          if (_currentState == PlayerState.celebrate) {
-            setState(PlayerState.idle);
-          }
-        });
-        break;
-    }
-  }
-
-  /// Handle pattern completion
-  void onPatternMatched(int patternValue, bool isChain) {
-    int basePoints = patternValue * 10;
-    int bonusPoints = isChain ? basePoints ~/ 2 : 0;
-    int totalPoints = basePoints + bonusPoints;
-    
-    addScore(totalPoints);
-    
-    // Award bonus time for chain matches
-    if (isChain) {
-      timeRemaining += 5.0;
-      timeRemaining = timeRemaining.clamp(0.0, 120.0);
+    if (health > 0) {
+      _startInvulnerability();
     }
     
-    onPatternComplete?.call(totalPoints);
-    setState(PlayerState.celebrate);
-  }
-
-  /// Start thinking animation when player is considering moves
-  void startThinking() {
-    setState(PlayerState.thinking);
-  }
-
-  /// Stop thinking and return to idle
-  void stopThinking() {
-    setState(PlayerState.idle);
-  }
-
-  /// Reset player state for new level
-  void resetForLevel(int level) {
-    currentLevel = level;
-    isMoving = false;
-    setState(PlayerState.idle);
+    animationState = PlayerAnimationState.damaged;
+    _playDamageFeedback();
     
-    // Set time based on level difficulty
-    switch (level) {
-      case 1:
-      case 2:
-      case 3:
-        timeRemaining = 90.0;
-        break;
-      case 4:
-      case 5:
-      case 6:
-        timeRemaining = 75.0;
-        break;
-      case 7:
-      case 8:
-        timeRemaining = 60.0;
-        break;
-      default:
-        timeRemaining = 45.0;
-        break;
-    }
+    // Reset animation after damage effect
+    Future.delayed(const Duration(milliseconds: 400), () {
+      if (animationState == PlayerAnimationState.damaged) {
+        animationState = PlayerAnimationState.idle;
+      }
+    });
   }
-
-  /// Get current time remaining as percentage
-  double getTimePercentage() {
-    double maxTime = switch (currentLevel) {
-      1 || 2 || 3 => 90.0,
-      4 || 5 || 6 => 75.0,
-      7 || 8 => 60.0,
-      _ => 45.0,
-    };
-    return (timeRemaining / maxTime).clamp(0.0, 1.0);
+  
+  /// Heals the player
+  void heal(int amount) {
+    health += amount;
+    health = math.min(maxHealth, health);
+    
+    animationState = PlayerAnimationState.healing;
+    _playHealFeedback();
+    
+    // Reset animation after heal effect
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (animationState == PlayerAnimationState.healing) {
+        animationState = PlayerAnimationState.idle;
+      }
+    });
   }
-
-  /// Check if player can afford a purchase
-  bool canAfford(int cost) {
-    return gems >= cost;
+  
+  /// Starts invulnerability period
+  void _startInvulnerability() {
+    invulnerabilityTimer = invulnerabilityDuration;
+    
+    // Add flashing effect during invulnerability
+    add(OpacityEffect.fadeOut(
+      EffectController(
+        duration: 0.1,
+        alternate: true,
+        infinite: true,
+      ),
+    ));
   }
-
-  /// Use hint system (costs gems)
-  bool useHint() {
-    const int hintCost = 10;
-    if (spendGems(hintCost)) {
-      setState(PlayerState.thinking);
-      return true;
-    }
-    return false;
+  
+  /// Called when invulnerability period ends
+  void _onInvulnerabilityEnd() {
+    // Remove flashing effect
+    removeWhere((component) => component is OpacityEffect);
+    opacity = 1.0;
   }
-
-  /// Extend time (costs gems)
-  bool extendTime() {
-    const int extensionCost = 15;
-    if (spendGems(extensionCost)) {
-      timeRemaining += 30.0;
-      timeRemaining = timeRemaining.clamp(0.0, 120.0);
-      return true;
-    }
-    return false;
+  
+  /// Increments combo multiplier
+  void _incrementCombo() {
+    comboMultiplier = math.min(maxComboMultiplier, comboMultiplier + 1);
   }
-
-  /// Reveal pattern (costs gems)
-  bool revealPattern() {
-    const int revealCost = 20;
-    if (spendGems(revealCost)) {
-      setState(PlayerState.celebrate);
-      return true;
-    }
-    return false;
+  
+  /// Resets combo multiplier
+  void _resetCombo() {
+    comboMultiplier = 1;
   }
+  
+  /// Resets player state for new level
+  void resetForNewLevel() {
+    deselectTile();
+    score = 0;
+    _resetCombo();
+    health = maxHealth;
+    invulnerabilityTimer = 0.0;
+    animationState = PlayerAnimationState.idle;
+    opacity = 1.0;
+    removeWhere((component) => component is OpacityEffect);
+  }
+  
+  /// Plays selection feedback
+  void _playSelectionFeedback() {
+    // Add scale effect for selection
+    add(ScaleEffect.to(
+      Vector2.all(1.1),
+      EffectController(duration: 0.1, alternate: true),
+    ));
+  }
+  
+  /// Plays invalid swap feedback
+  void _playInvalidSwapFeedback() {
+    // Add shake effect for invalid moves
+    add(MoveEffect.by(
+      Vector2(5, 0),
+      EffectController(duration: 0.05, alternate: true, repeatCount: 3),
+    ));
+  }
+  
+  /// Plays successful swap feedback
+  void _playSwapFeedback() {
+    // Add rotation effect for successful swaps
+    add(RotateEffect.by(
+      math.pi * 0.1,
+      EffectController(duration: 0.2, alternate: true),
+    ));
+  }
+  
+  /// Plays damage feedback
+  void _playDamageFeedback() {
+    // Add red tint and shake for damage
+    add(ColorEffect(
+      const Color(0xFFFF6B6B),
+      EffectController(duration: 0.3, alternate: true),
+    ));
+  }
+  
+  /// Plays heal feedback
+  void _playHealFeedback() {
+    // Add green tint and gentle pulse for healing
+    add(ColorEffect(
+      const Color(0xFF96CEB4),
+      EffectController(duration: 0.3, alternate: true),
+    ));
+  }
+  
+  /// Gets current health percentage
+  double get healthPercentage => health / maxHealth;
+  
+  /// Checks if player is at low health
+  bool get isLowHealth => health <= 1;
+  
+  /// Checks if player is dead
+  bool get isDead => health <= 0;
 }
 
-/// Enum for player animation states
-enum PlayerState {
+/// Animation states for the player component
+enum PlayerAnimationState {
   idle,
-  thinking,
-  celebrate,
+  selecting,
+  swapping,
+  celebrating,
+  damaged,
+  healing,
 }
